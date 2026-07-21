@@ -1,0 +1,40 @@
+# macOS, Xcode and SwiftPM
+.DS_Store
+.build/
+.swiftpm/
+DerivedData/
+*.xcarchive
+*.xcresult
+xcuserdata/
+*.xcuserstate
+
+# Local agent instructions and private design notes
+Docs/Discussion.md
+.codex/
+.claude/
+
+# Runtime data and diagnostics
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.log
+*.trace
+*.diagnostic.zip
+Threadline.diagnostic.zip
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.mobileprovision
+*.provisionprofile
+*.p12
+*.cer
+*.pem
+*.key
+
+# Packaged distribution artifacts
+dist/
+*.dmg
+*.dmg.sha256

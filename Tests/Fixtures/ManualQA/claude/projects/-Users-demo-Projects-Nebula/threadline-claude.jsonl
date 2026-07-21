@@ -1,0 +1,4 @@
+{"type":"user","sessionId":"threadline-claude-demo","uuid":"demo-u1","cwd":"/Users/demo/Projects/Nebula","timestamp":"2026-07-19T20:05:00.000Z","message":{"role":"user","content":"Create an elegant native macOS conversation browser."}}
+{"type":"assistant","sessionId":"threadline-claude-demo","uuid":"demo-a1","parentUuid":"demo-u1","timestamp":"2026-07-19T20:05:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"I’ll use a balanced three-column SwiftUI layout with local search and native controls."},{"type":"tool_use","id":"demo-tool","name":"Write","input":{"file_path":"RootView.swift"}}]}}
+{"type":"user","sessionId":"threadline-claude-demo","uuid":"demo-u2","parentUuid":"demo-a1","timestamp":"2026-07-19T20:05:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"demo-tool","content":"RootView.swift created"}]}}
+{"type":"summary","sessionId":"threadline-claude-demo","summary":"Native Threadline interface"}
