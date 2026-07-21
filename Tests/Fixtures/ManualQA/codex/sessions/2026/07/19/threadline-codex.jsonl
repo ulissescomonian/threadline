@@ -1,0 +1,5 @@
+{"timestamp":"2026-07-19T20:00:00.000Z","type":"session_meta","payload":{"id":"threadline-codex-demo","cwd":"/Users/demo/Projects/Aurora"}}
+{"timestamp":"2026-07-19T20:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Review the sync architecture and propose a safe conflict strategy."}]}}
+{"timestamp":"2026-07-19T20:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I’ll preserve both continuations as explicit branches whenever ancestry cannot be proven."}]}}
+{"timestamp":"2026-07-19T20:00:03.000Z","type":"response_item","payload":{"type":"function_call","name":"inspect_repository","arguments":"{\"path\":\"Sources/ConversationCore\"}","call_id":"demo-call"}}
+{"timestamp":"2026-07-19T20:00:04.000Z","type":"response_item","payload":{"type":"function_call_output","output":"Architecture inspected successfully.","call_id":"demo-call"}}
