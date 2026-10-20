@@ -9,8 +9,13 @@ public actor FolderSyncTransport: SyncTransport {
     private let currentDeviceID: String
     private let currentDeviceDirectoryName: String
     private let headAuthenticationKey: SymmetricKey?
+    private let publicationCodec: EncryptedEnvelopeCodec?
     private let segmentDataReader: @Sendable (URL, Int) throws -> Data
     private let segmentReadExecutor: FolderSegmentReadExecutor
+    private let readParallelism: @Sendable () -> Int
+    private var segmentInventories: [String: FolderSegmentInventory] = [:]
+    private var cachedSegmentFileCount = 0
+    internal private(set) var inventoryEnumerationCount = 0
 
     public init(
         rootURL: URL,
@@ -23,6 +28,7 @@ public actor FolderSyncTransport: SyncTransport {
         self.currentDeviceID = currentDeviceID
         currentDeviceDirectoryName = FolderSyncFileSystem.deviceDirectoryName(currentDeviceID)
         headAuthenticationKey = keyData.map(SymmetricKey.init(data:))
+        publicationCodec = keyData.flatMap { try? EncryptedEnvelopeCodec(keyData: $0) }
         segmentDataReader = { url, maximumByteCount in
             try FolderSyncFileSystem.readImmutableData(
                 at: url,
@@ -33,6 +39,13 @@ public actor FolderSyncTransport: SyncTransport {
             maximumConcurrentReads: FolderSyncLimits.maximumConcurrentSegmentReads,
             timeout: FolderSyncLimits.segmentReadTimeout
         )
+        readParallelism = {
+            FolderReadPolicy.maximumConcurrentReads(
+                thermalState: ProcessInfo.processInfo.thermalState,
+                lowPowerMode: ProcessInfo.processInfo.isLowPowerModeEnabled,
+                processorCount: ProcessInfo.processInfo.activeProcessorCount
+            )
+        }
         identifier = "folder-v1:\(manifest.syncSpaceID)"
     }
 
@@ -42,6 +55,8 @@ public actor FolderSyncTransport: SyncTransport {
         currentDeviceID: String,
         keyData: Data? = nil,
         segmentReadTimeout: TimeInterval = FolderSyncLimits.segmentReadTimeout,
+        maximumConcurrentReads: Int = 4,
+        readParallelism: @escaping @Sendable () -> Int = { 4 },
         segmentDataReader: @escaping @Sendable (URL, Int) throws -> Data
     ) {
         self.rootURL = rootURL
@@ -49,9 +64,11 @@ public actor FolderSyncTransport: SyncTransport {
         self.currentDeviceID = currentDeviceID
         currentDeviceDirectoryName = FolderSyncFileSystem.deviceDirectoryName(currentDeviceID)
         headAuthenticationKey = keyData.map(SymmetricKey.init(data:))
+        publicationCodec = keyData.flatMap { try? EncryptedEnvelopeCodec(keyData: $0) }
         self.segmentDataReader = segmentDataReader
+        self.readParallelism = { max(1, min(maximumConcurrentReads, readParallelism())) }
         segmentReadExecutor = FolderSegmentReadExecutor(
-            maximumConcurrentReads: FolderSyncLimits.maximumConcurrentSegmentReads,
+            maximumConcurrentReads: maximumConcurrentReads,
             timeout: segmentReadTimeout
         )
         identifier = "folder-v1:\(manifest.syncSpaceID)"
@@ -83,6 +100,8 @@ public actor FolderSyncTransport: SyncTransport {
         // namespace once for every logical transport batch.
         try Task.checkCancellation()
         try append(batches.flatMap { $0 }, to: segmentsURL)
+        segmentInventories.removeAll()
+        cachedSegmentFileCount = 0
     }
 
     public func pull(since cursor: SyncCursor) async throws -> SyncPullResult {
@@ -136,6 +155,7 @@ public actor FolderSyncTransport: SyncTransport {
         var completedItemCount = 0
         var completedByteCount: Int64 = 0
         var reachedBatchLimit = false
+        var lastProgressAt = ContinuousClock.now
 
         for device in inventory.devices {
             if reachedBatchLimit { break }
@@ -143,10 +163,16 @@ public actor FolderSyncTransport: SyncTransport {
             var chunkStart = 0
             while chunkStart < device.sequences.count, !deviceBlocked, !reachedBatchLimit {
                 try Task.checkCancellation()
-                let chunkEnd = min(
-                    chunkStart + FolderSyncLimits.maximumConcurrentSegmentReads,
-                    device.sequences.count
-                )
+                let parallelism = max(1, min(FolderSyncLimits.maximumConcurrentSegmentReads, readParallelism()))
+                var chunkEnd = chunkStart
+                var readBytes: Int64 = 0
+                while chunkEnd < device.sequences.count, chunkEnd - chunkStart < parallelism {
+                    let bytes = device.sequences[chunkEnd].byteCount
+                    if chunkEnd > chunkStart,
+                       bytes > FolderReadPolicy.maximumReadWindowBytes - readBytes { break }
+                    readBytes += bytes
+                    chunkEnd += 1
+                }
                 let outcomes = await decodeConcurrently(
                     Array(device.sequences[chunkStart..<chunkEnd]),
                     deviceHash: device.deviceHash
@@ -190,13 +216,17 @@ public actor FolderSyncTransport: SyncTransport {
                             sequence.byteCount,
                             message: "The folder sync progress byte count overflowed."
                         )
-                        await onProgress(SyncTransportProgress(
-                            activity: .reading,
-                            completedItemCount: completedItemCount,
-                            totalItemCount: inventory.itemCount,
-                            completedByteCount: completedByteCount,
-                            totalByteCount: inventory.byteCount
-                        ))
+                        if completedItemCount.isMultiple(of: 16)
+                            || lastProgressAt.duration(to: .now) >= .milliseconds(100) {
+                            await onProgress(SyncTransportProgress(
+                                activity: .reading,
+                                completedItemCount: completedItemCount,
+                                totalItemCount: inventory.itemCount,
+                                completedByteCount: completedByteCount,
+                                totalByteCount: inventory.byteCount
+                            ))
+                            lastProgressAt = .now
+                        }
                     }
                     if deviceBlocked || reachedBatchLimit { break }
                 }
@@ -204,6 +234,13 @@ public actor FolderSyncTransport: SyncTransport {
             }
         }
 
+        await onProgress(SyncTransportProgress(
+            activity: .reading,
+            completedItemCount: completedItemCount,
+            totalItemCount: inventory.itemCount,
+            completedByteCount: completedByteCount,
+            totalByteCount: inventory.byteCount
+        ))
         return SyncPullResult(
             envelopes: pulled,
             cursor: try encodedCursor(folderCursor, updatedAt: Date()),
@@ -322,40 +359,11 @@ public actor FolderSyncTransport: SyncTransport {
                             fileName: existingMarkerURL.lastPathComponent,
                             envelope: envelope
                         )
-                        let segment = FolderEnvelopeSegment(
-                            version: 1,
-                            sequence: marker.sequence,
-                            writerDeviceHash: currentDeviceDirectoryName,
-                            envelope: envelope
+                        try verifyExistingPublication(
+                            marker,
+                            envelope: envelope,
+                            segmentsURL: coordinatedURL
                         )
-                        let segmentData = try FolderSyncFileSystem.encoder.encode(segment)
-                        let segmentHash = FolderSyncFileSystem.sha256(segmentData)
-                        let expectedSegmentName = Self.segmentFileName(
-                            sequence: marker.sequence,
-                            contentHash: segmentHash
-                        )
-                        guard marker.segmentFileName == expectedSegmentName else {
-                            throw ThreadlineError.invalidPayload(
-                                "A folder sync publication marker does not match its envelope."
-                            )
-                        }
-                        let segmentURL = coordinatedURL.appendingPathComponent(expectedSegmentName)
-                        if FileManager.default.fileExists(atPath: segmentURL.path) {
-                            let existingData = try Self.readLocalFile(
-                                at: segmentURL,
-                                maximumByteCount: FolderSyncLimits.maximumSegmentBytes
-                            )
-                            guard FolderSyncFileSystem.sha256(existingData) == segmentHash else {
-                                throw ThreadlineError.invalidPayload(
-                                    "A published folder sync segment failed its integrity check."
-                                )
-                            }
-                        } else {
-                            try FolderSyncFileSystem.publishDataWithoutReplacing(
-                                segmentData,
-                                to: segmentURL
-                            )
-                        }
                         continue
                     }
 
@@ -448,6 +456,73 @@ public actor FolderSyncTransport: SyncTransport {
         if let operationError { throw operationError }
     }
 
+    private func verifyExistingPublication(
+        _ marker: FolderPublicationMarker,
+        envelope: SyncEnvelope,
+        segmentsURL: URL
+    ) throws {
+        let segmentURL = segmentsURL.appendingPathComponent(marker.segmentFileName)
+        guard FileManager.default.fileExists(atPath: segmentURL.path) else {
+            throw ThreadlineError.invalidPayload(
+                "A previously published item cannot be verified. Make the original sync file available on this Mac, then retry. Do not delete the sync folder or conversation histories."
+            )
+        }
+
+        let existingData: Data
+        do {
+            existingData = try Self.readLocalFile(
+                at: segmentURL,
+                maximumByteCount: FolderSyncLimits.maximumSegmentBytes
+            )
+        } catch {
+            throw ThreadlineError.invalidPayload(
+                "A previously published item cannot be verified. Make the original sync file available on this Mac, then retry. Do not delete the sync folder or conversation histories."
+            )
+        }
+        guard FolderSyncFileSystem.sha256(existingData) == marker.segmentHash else {
+            throw ThreadlineError.invalidPayload(
+                "The previously published item failed its integrity check. Keep both libraries and restore the original sync file before retrying."
+            )
+        }
+
+        let publishedSegment: FolderEnvelopeSegment
+        do {
+            publishedSegment = try FolderSyncFileSystem.decoder.decode(
+                FolderEnvelopeSegment.self,
+                from: existingData
+            )
+            guard publishedSegment.version == 1,
+                  publishedSegment.sequence == marker.sequence,
+                  publishedSegment.writerDeviceHash == currentDeviceDirectoryName,
+                  publishedSegment.envelope.id == marker.envelopeID else {
+                throw ThreadlineError.invalidPayload("Invalid published segment")
+            }
+            try SyncEnvelopeLimits.validate(publishedSegment.envelope)
+        } catch {
+            throw ThreadlineError.invalidPayload(
+                "The previously published item failed its integrity check. Keep both libraries and restore the original sync file before retrying."
+            )
+        }
+
+        if publishedSegment.envelope == envelope { return }
+        guard let publicationCodec else {
+            throw ThreadlineError.invalidPayload(
+                "A previously published item cannot be verified. Make the original sync file available on this Mac, then retry. Do not delete the sync folder or conversation histories."
+            )
+        }
+        do {
+            let publishedConversation = try publicationCodec.open(publishedSegment.envelope)
+            let candidateConversation = try publicationCodec.open(envelope)
+            guard publishedConversation == candidateConversation else {
+                throw ThreadlineError.invalidPayload("Different conversation data")
+            }
+        } catch {
+            throw ThreadlineError.invalidPayload(
+                "The previously published item contains different conversation data. Keep both libraries and resolve the source-device conflict before retrying."
+            )
+        }
+    }
+
     private func validatedDeviceDirectories(at devicesURL: URL) throws -> [URL] {
         let entries = try FolderSyncFileSystem.directoryContents(at: devicesURL)
         var devices: [URL] = []
@@ -511,7 +586,29 @@ public actor FolderSyncTransport: SyncTransport {
                 // handled by the established complete inventory path.
                 performedFullScan = true
             }
-            let grouped = try segmentFilesBySequence(at: segmentsURL)
+            let grouped: [Int64: [FolderPendingCandidate]]
+            if !forceFullScan,
+               let cached = segmentInventories[deviceHash],
+               cached.modificationDate == currentModificationDate {
+                grouped = cached.sequences
+            } else {
+                grouped = try segmentFilesBySequence(at: segmentsURL)
+                if let previous = segmentInventories.removeValue(forKey: deviceHash) {
+                    cachedSegmentFileCount -= previous.fileCount
+                }
+                let fileCount = grouped.values.reduce(0) { $0 + $1.count }
+                if let date = currentModificationDate,
+                   fileCount <= FolderReadPolicy.maximumCachedSegmentFiles {
+                    if cachedSegmentFileCount + fileCount > FolderReadPolicy.maximumCachedSegmentFiles {
+                        segmentInventories.removeAll()
+                        cachedSegmentFileCount = 0
+                    }
+                    segmentInventories[deviceHash] = FolderSegmentInventory(
+                        modificationDate: date, sequences: grouped, fileCount: fileCount
+                    )
+                    cachedSegmentFileCount += fileCount
+                }
+            }
             var sequence = (watermarks[deviceHash] ?? 0) + 1
             var pendingSequences: [FolderPendingSequence] = []
             while let candidates = grouped[sequence] {
@@ -590,6 +687,7 @@ public actor FolderSyncTransport: SyncTransport {
     private func segmentFilesBySequence(
         at segmentsURL: URL
     ) throws -> [Int64: [FolderPendingCandidate]] {
+        inventoryEnumerationCount += 1
         let entries = try FolderSyncFileSystem.directoryContents(at: segmentsURL)
         guard entries.count <= FolderSyncLimits.maximumSegmentFilesPerDevice else {
             throw ThreadlineError.invalidPayload(
@@ -1075,6 +1173,12 @@ private struct FolderPendingInventory: Sendable {
     let segmentModificationDates: [String: Date]
 }
 
+private struct FolderSegmentInventory {
+    let modificationDate: Date
+    let sequences: [Int64: [FolderPendingCandidate]]
+    let fileCount: Int
+}
+
 private struct FolderPendingDevice: Sendable {
     let deviceHash: String
     let sequences: [FolderPendingSequence]
@@ -1211,8 +1315,29 @@ private final class FolderSegmentReadResolution: @unchecked Sendable {
 
 private extension FolderSyncLimits {
     static let maximumDuplicateSegmentsPerSequence = 8
-    static let maximumConcurrentSegmentReads = 4
+    static let maximumConcurrentSegmentReads = 8
     static let segmentReadTimeout: TimeInterval = 45
     static let maximumSegmentFilesPerDevice = 1_000_000
     static let maximumPublicationMarkerBytes = 64 * 1_024
+}
+
+enum FolderReadPolicy {
+    static let maximumReadWindowBytes: Int64 = 32 * 1_024 * 1_024
+    static let maximumCachedSegmentFiles = 65_536
+
+    static func maximumConcurrentReads(
+        thermalState: ProcessInfo.ThermalState,
+        lowPowerMode: Bool,
+        processorCount: Int
+    ) -> Int {
+        let normal = min(8, max(2, processorCount / 2))
+        if lowPowerMode { return min(2, normal) }
+        switch thermalState {
+        case .nominal: return normal
+        case .fair: return max(2, normal / 2)
+        case .serious: return 2
+        case .critical: return 1
+        @unknown default: return 2
+        }
+    }
 }

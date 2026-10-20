@@ -752,6 +752,13 @@ final class AppModel {
 
     private func publishSyncProgress(_ progress: SyncProgress, invocationID: UUID) {
         guard isSyncing, syncInvocationID == invocationID else { return }
+        if let previous = syncProgress,
+           previous.phase == progress.phase,
+           progress.phase != .completed,
+           progress.updatedAt.timeIntervalSince(previous.updatedAt) < 0.2,
+           progress.totalItemCount != progress.completedItemCount {
+            return
+        }
         syncProgress = progress
     }
 

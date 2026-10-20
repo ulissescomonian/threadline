@@ -43,6 +43,58 @@ final class FolderSyncTransportTests: XCTestCase {
         XCTAssertEqual(try fixture.segmentFiles().count, 1)
     }
 
+    func testRepeatedEncryptedPublicationAcceptsEquivalentFreshCiphertext() async throws {
+        let fixture = try FolderTransportFixture()
+        defer { fixture.cleanup() }
+        let writer = fixture.transport(deviceID: "writer-device", keyData: fixture.key)
+        let codec = try EncryptedEnvelopeCodec(keyData: fixture.key)
+        let conversation = folderConversation(origin: "writer-device")
+        let first = try codec.seal(
+            conversation,
+            originDeviceID: "writer-device",
+            createdAt: Date(timeIntervalSince1970: 100)
+        )
+        let retry = try codec.seal(
+            conversation,
+            originDeviceID: "writer-device",
+            createdAt: Date(timeIntervalSince1970: 101)
+        )
+
+        XCTAssertEqual(first.id, retry.id)
+        XCTAssertNotEqual(first, retry)
+        try await writer.push([first])
+        try await writer.push([retry])
+
+        XCTAssertEqual(try fixture.segmentFiles().count, 1)
+    }
+
+    func testRepeatedPublicationRequiresOriginalSegmentForVerification() async throws {
+        let fixture = try FolderTransportFixture()
+        defer { fixture.cleanup() }
+        let writer = fixture.transport(deviceID: "writer-device", keyData: fixture.key)
+        let codec = try EncryptedEnvelopeCodec(keyData: fixture.key)
+        let conversation = folderConversation(origin: "writer-device")
+        let first = try codec.seal(
+            conversation,
+            originDeviceID: "writer-device",
+            createdAt: Date(timeIntervalSince1970: 200)
+        )
+        let retry = try codec.seal(
+            conversation,
+            originDeviceID: "writer-device",
+            createdAt: Date(timeIntervalSince1970: 201)
+        )
+        try await writer.push([first])
+        try FileManager.default.removeItem(at: try XCTUnwrap(fixture.segmentFiles().first))
+
+        do {
+            try await writer.push([retry])
+            XCTFail("Expected a missing original publication to stop the retry")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("cannot be verified"))
+        }
+    }
+
     func testAuthenticatedHeadSkipsNoOpAndTamperingFallsBackToInventory() async throws {
         let fixture = try FolderTransportFixture()
         defer { fixture.cleanup() }
@@ -292,6 +344,33 @@ final class FolderSyncTransportTests: XCTestCase {
         XCTAssertEqual(second.envelopes.map(\.id), Array(envelopes.dropFirst(256)).map(\.id))
         XCTAssertEqual(second.remainingItemCount, 0)
         XCTAssertEqual(second.remainingByteCount, 0)
+        let enumerationCount = await reader.inventoryEnumerationCount
+        XCTAssertEqual(enumerationCount, 1, "Draining another page must reuse the unchanged inventory")
+    }
+
+    func testInventoryInvalidatesWhenFilesArriveBetweenPages() async throws {
+        let fixture = try FolderTransportFixture()
+        defer { fixture.cleanup() }
+        let writer = fixture.transport(deviceID: "writer-device")
+        let reader = fixture.transport(deviceID: "reader-device")
+        let envelopes = (0..<260).map {
+            folderEnvelope(id: "initial-\($0)", origin: "writer-device", byte: UInt8($0 % 251))
+        }
+        try await writer.push(envelopes)
+        let first = try await reader.pull(since: SyncCursor())
+        try await writer.push([folderEnvelope(id: "arrived-later", origin: "writer-device", byte: 0x32)])
+        let second = try await reader.pull(since: first.cursor)
+        XCTAssertEqual(second.envelopes.map(\.id), Array(envelopes.suffix(4)).map(\.id) + ["arrived-later"])
+        let enumerations = await reader.inventoryEnumerationCount
+        XCTAssertEqual(enumerations, 2)
+    }
+
+    func testReadPolicyReducesWorkForHeatAndLowPower() {
+        XCTAssertEqual(FolderReadPolicy.maximumConcurrentReads(thermalState: .nominal, lowPowerMode: false, processorCount: 16), 8)
+        XCTAssertEqual(FolderReadPolicy.maximumConcurrentReads(thermalState: .fair, lowPowerMode: false, processorCount: 16), 4)
+        XCTAssertEqual(FolderReadPolicy.maximumConcurrentReads(thermalState: .serious, lowPowerMode: false, processorCount: 16), 2)
+        XCTAssertEqual(FolderReadPolicy.maximumConcurrentReads(thermalState: .critical, lowPowerMode: false, processorCount: 16), 1)
+        XCTAssertEqual(FolderReadPolicy.maximumConcurrentReads(thermalState: .nominal, lowPowerMode: true, processorCount: 16), 2)
     }
 
     func testBlockedReadsTimeOutWithoutAdvancingCursorOrLeakingPastLimit() async throws {
@@ -480,6 +559,36 @@ private func folderEnvelope(id: String, origin: String, byte: UInt8) -> SyncEnve
         createdAt: Date(timeIntervalSince1970: TimeInterval(byte)),
         encryptedPayload: Data(repeating: byte, count: 32),
         payloadHash: String(repeating: String(format: "%02x", byte), count: 32)
+    )
+}
+
+private func folderConversation(origin: String) -> ProviderConversation {
+    let date = Date(timeIntervalSince1970: 50)
+    return ProviderConversation(
+        summary: ConversationSummary(
+            id: "encrypted-publication",
+            provider: .codex,
+            providerSessionID: "encrypted-publication-session",
+            title: "Equivalent encrypted publication",
+            preview: "Retry without duplicate work",
+            createdAt: date,
+            updatedAt: date,
+            originDeviceID: origin,
+            messageCount: 1
+        ),
+        events: [ConversationEvent(
+            id: "encrypted-publication-event",
+            conversationID: "encrypted-publication",
+            sequence: 1,
+            timestamp: date,
+            kind: .userMessage,
+            role: .user,
+            text: "Retry without duplicate work",
+            contentHash: "encrypted-publication-content",
+            sourceDeviceID: origin
+        )],
+        sourceFingerprint: "encrypted-publication-fingerprint",
+        sourceSchemaVersion: "test-v1"
     )
 }
 

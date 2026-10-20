@@ -108,10 +108,24 @@ public protocol ConversationStore: Sendable {
     func pendingEnvelopes(limit: Int, maximumBytes: Int) async throws -> [SyncEnvelope]
     func markEnvelopesAcknowledged(ids: [String]) async throws
     func applyRemote(_ envelopes: [SyncEnvelope]) async throws
+    func applyRemoteBatch(
+        _ envelopes: [SyncEnvelope],
+        onProgress: @escaping @Sendable (RemoteApplyResult) async -> Void
+    ) async throws -> RemoteApplyResult
     func healthSnapshot() async throws -> HealthSnapshot
 }
 
 public extension ConversationStore {
+    func applyRemoteBatch(
+        _ envelopes: [SyncEnvelope],
+        onProgress: @escaping @Sendable (RemoteApplyResult) async -> Void = { _ in }
+    ) async throws -> RemoteApplyResult {
+        try await applyRemote(envelopes)
+        let result = RemoteApplyResult(processedEnvelopeCount: envelopes.count)
+        await onProgress(result)
+        return result
+    }
+
     func loadProviderIngestCursor(provider: ProviderKind) async throws -> Date? { nil }
 
     func saveProviderIngestCursor(_ cursor: Date, provider: ProviderKind) async throws {}

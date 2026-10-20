@@ -58,7 +58,7 @@ after replacing a build.
 ## Release DMG packaging
 
 The distributed release is an unsigned Apple Silicon DMG containing Threadline
-1.0.0 (build 13). The app has a local code signature rather than an Apple
+1.0.1 (build 15). The app has a local code signature rather than an Apple
 Developer ID signature. Neither app nor DMG is notarized. Installation
 documentation must direct users to Finder's **Open** or **System Settings →
 Privacy & Security → Open Anyway**. Never recommend disabling Gatekeeper,
@@ -68,7 +68,7 @@ After `make app`, create the release artifacts with:
 
 ```bash
 Scripts/package_dmg.sh
-shasum -a 256 -c dist/Threadline-1.0.0-arm64.dmg.sha256
+(cd dist && shasum -a 256 -c Threadline-1.0.1-arm64.dmg.sha256)
 ```
 
 The script:
@@ -82,10 +82,10 @@ The script:
 7. stages output temporarily and moves each finished file into place only after
    verification.
 
-For the 1.0.0 Apple Silicon bundle the outputs are:
+For the 1.0.1 Apple Silicon bundle the outputs are:
 
-- `dist/Threadline-1.0.0-arm64.dmg`
-- `dist/Threadline-1.0.0-arm64.dmg.sha256`
+- `dist/Threadline-1.0.1-arm64.dmg`
+- `dist/Threadline-1.0.1-arm64.dmg.sha256`
 
 `dist/` is ignored by Git. Attach both files to the same GitHub Release so users
 can verify the DMG before opening it. `APP_PATH` and `OUTPUT_DIR` may select a
@@ -96,6 +96,23 @@ artifact, staple a ticket, or publish a GitHub Release. A Developer ID pipeline
 must add Apple signing with a timestamp, notarization, stapling, and release
 publication without weakening the script's architecture, app-signature, image,
 or checksum verification.
+
+### Synchronization performance
+
+Run `zsh Scripts/benchmark_sync.sh` to measure optimized folder reads and local
+indexing with synthetic short conversations, longer transcripts, and historical
+versions of one conversation. Each run uses isolated temporary files and reports
+record count, unique conversation count, payload bytes, and separate read and
+apply durations. Setup/encryption time is excluded. These are local catch-up
+measurements, not measurements of a cloud provider's network download speed.
+
+Receive pages remain bounded by 256 records and 128 MiB of encrypted payload.
+At most one additional page is read ahead, with read-ahead disabled under serious
+thermal pressure or Low Power Mode. A store transaction contains at most 32
+records or 16 MiB (one larger valid envelope is processed on its own). Every
+envelope is verified, and only monotonic, same-source append snapshots without
+conflicts are consolidated. A receive cursor is saved only after the page is
+fully applied; interrupted pages are safe to replay.
 
 ## Architecture and ownership
 

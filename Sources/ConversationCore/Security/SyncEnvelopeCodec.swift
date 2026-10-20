@@ -65,7 +65,7 @@ public struct PlaintextEnvelopeCodec: SyncEnvelopeCodec {
     }()
 
     static func sha256(_ data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        HexEncoding.lowercaseString(SHA256.hash(data: data))
     }
 
     static func validatePayload(_ conversation: ProviderConversation, in envelope: SyncEnvelope) throws {

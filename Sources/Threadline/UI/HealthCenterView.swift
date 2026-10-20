@@ -234,6 +234,17 @@ private struct SyncProgressCard: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
+                if let summary = progress.threadlineReceiveSummary {
+                    Text(summary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if let timing = progress.threadlineReceiveTiming {
+                    Text(timing)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+
                 HStack {
                     Text(progress.activity)
                         .lineLimit(2)

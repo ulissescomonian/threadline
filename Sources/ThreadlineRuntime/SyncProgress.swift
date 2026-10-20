@@ -22,6 +22,11 @@ public struct SyncProgress: Sendable, Hashable {
     public let startedAt: Date
     public let updatedAt: Date
     public let lastAdvancedAt: Date
+    public let receivedRecordCount: Int
+    public let updatedConversationCount: Int?
+    public let supersededVersionCount: Int
+    public let readingSeconds: TimeInterval
+    public let applyingSeconds: TimeInterval
 
     public init(
         runID: UUID,
@@ -35,7 +40,12 @@ public struct SyncProgress: Sendable, Hashable {
         activity: String,
         startedAt: Date,
         updatedAt: Date = Date(),
-        lastAdvancedAt: Date? = nil
+        lastAdvancedAt: Date? = nil,
+        receivedRecordCount: Int = 0,
+        updatedConversationCount: Int? = nil,
+        supersededVersionCount: Int = 0,
+        readingSeconds: TimeInterval = 0,
+        applyingSeconds: TimeInterval = 0
     ) {
         self.runID = runID
         self.phase = phase
@@ -49,6 +59,11 @@ public struct SyncProgress: Sendable, Hashable {
         self.startedAt = startedAt
         self.updatedAt = updatedAt
         self.lastAdvancedAt = lastAdvancedAt ?? updatedAt
+        self.receivedRecordCount = receivedRecordCount
+        self.updatedConversationCount = updatedConversationCount
+        self.supersededVersionCount = supersededVersionCount
+        self.readingSeconds = readingSeconds
+        self.applyingSeconds = applyingSeconds
     }
 
     public var fractionCompleted: Double? {

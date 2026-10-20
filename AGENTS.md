@@ -50,7 +50,7 @@ After `make app`, create and verify the release DMG with:
 
 ```bash
 Scripts/package_dmg.sh
-(cd dist && shasum -a 256 -c Threadline-1.0.0-arm64.dmg.sha256)
+(cd dist && shasum -a 256 -c Threadline-1.0.1-arm64.dmg.sha256)
 ```
 
 `APP_PATH` and `OUTPUT_DIR` may override the default bundle and output

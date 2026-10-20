@@ -893,6 +893,237 @@ final class SQLiteConversationStoreTests: XCTestCase {
         XCTAssertNotNil(destinationHealth.lastSyncAt)
     }
 
+    func testRemoteBatchCoalescesVerifiedAppendsAndQuarantinesInvalidVersions() async throws {
+        let fixture = try StoreFixture(deviceID: "book")
+        defer { fixture.cleanup() }
+        try await fixture.store.migrate()
+        let codec = PlaintextEnvelopeCodec()
+        var envelopes = try (0..<8).map { version in
+            try codec.seal(Self.conversation(
+                updatedAt: Date(timeIntervalSince1970: 2_000 + Double(version)),
+                fingerprint: "append-\(version)",
+                additionalEventTexts: (0..<version).map { "Appended event \($0)" }
+            ), originDeviceID: "mini", createdAt: Date(timeIntervalSince1970: 3_000 + Double(version)))
+        }
+        envelopes.insert(SyncEnvelope(
+            id: "invalid-version", objectType: "conversation", logicalVersion: 1,
+            originDeviceID: "mini", createdAt: Date(),
+            encryptedPayload: Data("invalid".utf8), payloadHash: String(repeating: "0", count: 64)
+        ), at: 3)
+
+        let result = try await fixture.store.applyRemoteBatch(envelopes)
+        let loaded = try await fixture.store.conversation(id: "conversation-1")
+        let commits = await fixture.store.remoteBatchCommitCount
+        let writes = await fixture.store.remoteConversationWriteCount
+        let health = try await fixture.store.healthSnapshot()
+        XCTAssertEqual(result.processedEnvelopeCount, 9)
+        XCTAssertEqual(result.supersededVersionCount, 7)
+        XCTAssertEqual(result.quarantinedEnvelopeCount, 1)
+        XCTAssertEqual(result.updatedConversationIDs, ["conversation-1"])
+        XCTAssertEqual(loaded?.events.count, 9)
+        XCTAssertEqual(commits, 1)
+        XCTAssertEqual(writes, 1)
+        XCTAssertTrue(health.issues.contains { $0.id == "sync-quarantine" && $0.detail.hasPrefix("1 ") })
+    }
+
+    func testRemoteBatchPreservesConflictsCorrectionsAndOutOfOrderResults() async throws {
+        let batch = try StoreFixture(deviceID: "receiver")
+        let sequential = try StoreFixture(deviceID: "receiver")
+        defer { batch.cleanup(); sequential.cleanup() }
+        try await batch.store.migrate()
+        try await sequential.store.migrate()
+        let codec = PlaintextEnvelopeCodec()
+        let originals = [
+            Self.conversation(title: "First", updatedAt: Date(timeIntervalSince1970: 2_000), fingerprint: "one"),
+            Self.conversation(title: "Corrected", updatedAt: Date(timeIntervalSince1970: 2_100), fingerprint: "two", secondEventText: "Corrected prefix"),
+            Self.conversation(title: "Stale", updatedAt: Date(timeIntervalSince1970: 1_900), fingerprint: "stale"),
+            Self.conversation(title: "Other device", updatedAt: Date(timeIntervalSince1970: 2_200), fingerprint: "other", originDeviceID: "other"),
+        ]
+        let envelopes = try originals.enumerated().map { offset, conversation in
+            try codec.seal(conversation, originDeviceID: conversation.summary.originDeviceID,
+                           createdAt: Date(timeIntervalSince1970: 3_000 + Double(offset)))
+        }
+        let result = try await batch.store.applyRemoteBatch(envelopes)
+        for envelope in envelopes { try await sequential.store.applyRemote([envelope]) }
+        let batched = try await batch.store.listConversations(query: nil, provider: nil, favoritesOnly: false)
+        let expected = try await sequential.store.listConversations(query: nil, provider: nil, favoritesOnly: false)
+        XCTAssertEqual(batched, expected)
+        XCTAssertEqual(result.supersededVersionCount, 0)
+        for summary in expected {
+            let actual = try await batch.store.conversation(id: summary.id)
+            let reference = try await sequential.store.conversation(id: summary.id)
+            XCTAssertEqual(actual, reference)
+        }
+    }
+
+    func testRemoteBatchRollsBackFailedWindowAndCanRetry() async throws {
+        let fixture = try StoreFixture(deviceID: "book")
+        defer { fixture.cleanup() }
+        try await fixture.store.migrate()
+        let inspection = try SQLiteConnection(path: fixture.directory.appendingPathComponent("library.sqlite").path)
+        try inspection.execute("CREATE TRIGGER fail_import BEFORE INSERT ON conversations WHEN NEW.id = 'broken' BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END")
+        let codec = PlaintextEnvelopeCodec()
+        let envelopes = try ["good", "broken", "later"].map { id in
+            try codec.seal(Self.conversation(conversationID: id, providerSessionID: id), originDeviceID: "mini", createdAt: Date())
+        }
+        await XCTAssertThrowsErrorAsync { try await fixture.store.applyRemote(envelopes) }
+        XCTAssertEqual(try inspection.scalarInt("SELECT COUNT(*) FROM conversations"), 0)
+        try inspection.execute("DROP TRIGGER fail_import")
+        let result = try await fixture.store.applyRemoteBatch(envelopes)
+        XCTAssertEqual(result.updatedConversationIDs?.count, 3)
+    }
+
+    func testRemoteBatchRetainsQuarantineRecoveryOrderForSameEnvelopeIdentity() async throws {
+        let fixture = try StoreFixture(deviceID: "book")
+        defer { fixture.cleanup() }
+        try await fixture.store.migrate()
+        let codec = PlaintextEnvelopeCodec()
+        let valid = try codec.seal(Self.conversation(), originDeviceID: "mini", createdAt: Date())
+        let invalid = SyncEnvelope(
+            id: valid.id, objectType: valid.objectType, logicalVersion: valid.logicalVersion,
+            originDeviceID: valid.originDeviceID, createdAt: valid.createdAt,
+            encryptedPayload: Data("damaged".utf8), payloadHash: valid.payloadHash
+        )
+        try await fixture.store.applyRemote([invalid, valid])
+        let recovered = try await fixture.store.healthSnapshot()
+        XCTAssertFalse(recovered.issues.contains { $0.id == "sync-quarantine" })
+        try await fixture.store.applyRemote([valid, invalid])
+        let damagedLast = try await fixture.store.healthSnapshot()
+        XCTAssertTrue(damagedLast.issues.contains { $0.id == "sync-quarantine" })
+    }
+
+    func testCoalescingPreservesFirstFavoriteAndIdenticalSourceNoOpSemantics() async throws {
+        let original = Self.conversation(title: "Original", fingerprint: "same-source")
+        let sameSource = Self.conversation(title: "Must remain ignored", fingerprint: "same-source")
+        var favoriteSummary = original.summary
+        favoriteSummary.isFavorite = true
+        let favorite = ProviderConversation(
+            summary: favoriteSummary, events: original.events,
+            sourceFingerprint: original.sourceFingerprint, sourceSchemaVersion: original.sourceSchemaVersion
+        )
+        let appended = Self.conversation(
+            title: "Appended", updatedAt: Date(timeIntervalSince1970: 3_000), fingerprint: "appended",
+            additionalEventText: "New event"
+        )
+        for candidates in [[original, sameSource], [favorite, appended]] {
+            let batch = try StoreFixture(deviceID: "receiver")
+            let sequential = try StoreFixture(deviceID: "receiver")
+            defer { batch.cleanup(); sequential.cleanup() }
+            try await batch.store.migrate()
+            try await sequential.store.migrate()
+            let envelopes = try candidates.enumerated().map { offset, candidate in
+                try PlaintextEnvelopeCodec().seal(candidate, originDeviceID: "mini", createdAt: Date(timeIntervalSince1970: 4_000 + Double(offset)))
+            }
+            try await batch.store.applyRemote(envelopes)
+            for envelope in envelopes { try await sequential.store.applyRemote([envelope]) }
+            let actual = try await batch.store.conversation(id: "conversation-1")
+            let expected = try await sequential.store.conversation(id: "conversation-1")
+            XCTAssertEqual(actual, expected)
+        }
+    }
+
+    func testCancellingRemoteBatchKeepsCompletedWindowAndStopsBeforeNext() async throws {
+        let fixture = try StoreFixture(deviceID: "book")
+        defer { fixture.cleanup() }
+        try await fixture.store.migrate()
+        let codec = PlaintextEnvelopeCodec()
+        let envelopes = try (0..<70).map { index in
+            try codec.seal(Self.conversation(conversationID: "cancel-\(index)", providerSessionID: "cancel-\(index)"), originDeviceID: "mini", createdAt: Date())
+        }
+        let task = Task {
+            try await fixture.store.applyRemoteBatch(envelopes) { _ in
+                withUnsafeCurrentTask { $0?.cancel() }
+            }
+        }
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {}
+        let health = try await fixture.store.healthSnapshot()
+        XCTAssertEqual(health.indexedConversationCount, 32)
+        let retried = try await fixture.store.applyRemoteBatch(envelopes)
+        XCTAssertEqual(retried.processedEnvelopeCount, 70)
+        let complete = try await fixture.store.healthSnapshot()
+        XCTAssertEqual(complete.indexedConversationCount, 70)
+    }
+
+    func testAuthoritativeRemoteSessionSuppressesStaleRemoteAndLocalRepublishing() async throws {
+        let fixture = try StoreFixture(deviceID: "source-device")
+        defer { fixture.cleanup() }
+        try await fixture.store.migrate()
+        try await fixture.store.upsert(Self.conversation(
+            title: "Original source snapshot",
+            fingerprint: "source-v1",
+            originDeviceID: "source-device"
+        ))
+        let initial = try await fixture.store.pendingEnvelopes(limit: 10)
+        try await fixture.store.markEnvelopesAcknowledged(ids: initial.map(\.id))
+
+        let databaseURL = fixture.directory.appendingPathComponent("library.sqlite")
+        let copiedDatabase = try SQLiteConnection(path: databaseURL.path)
+        try copiedDatabase.execute(
+            "INSERT INTO store_metadata(key, text_value) VALUES(?, ?)",
+            bindings: [
+                .text("threadline.authoritative-device.v1"),
+                .text("source-device"),
+            ]
+        )
+        let copiedStore = try SQLiteConversationStore(
+            databaseURL: databaseURL,
+            deviceID: "copied-device",
+            envelopeCodec: PlaintextEnvelopeCodec()
+        )
+        try await copiedStore.migrate()
+
+        let authoritativeUpdate = Self.conversation(
+            title: "Authoritative source update",
+            updatedAt: Date(timeIntervalSince1970: 3_000),
+            fingerprint: "source-v2",
+            originDeviceID: "source-device"
+        )
+        let codec = PlaintextEnvelopeCodec()
+        try await copiedStore.applyRemote([
+            try codec.seal(
+                authoritativeUpdate,
+                originDeviceID: "source-device",
+                createdAt: Date(timeIntervalSince1970: 3_001)
+            ),
+        ])
+
+        let staleUpdate = Self.conversation(
+            title: "Stale source update",
+            updatedAt: Date(timeIntervalSince1970: 2_900),
+            fingerprint: "source-stale",
+            originDeviceID: "source-device"
+        )
+        try await copiedStore.applyRemote([
+            try codec.seal(
+                staleUpdate,
+                originDeviceID: "source-device",
+                createdAt: Date(timeIntervalSince1970: 2_901)
+            ),
+        ])
+
+        let localReplica = Self.conversation(
+            conversationID: "copied-local-replica",
+            title: "Must not be republished",
+            updatedAt: Date(timeIntervalSince1970: 4_000),
+            fingerprint: "copied-local",
+            originDeviceID: "copied-device"
+        )
+        let didRepublish = try await copiedStore.upsertIfChanged(localReplica)
+        let loaded = try await copiedStore.conversation(id: "conversation-1")
+        let pending = try await copiedStore.pendingEnvelopes(limit: 10)
+
+        XCTAssertEqual(loaded?.summary.title, "Authoritative source update")
+        XCTAssertFalse(didRepublish)
+        XCTAssertTrue(pending.isEmpty)
+        XCTAssertEqual(
+            try copiedDatabase.scalarInt("SELECT COUNT(*) FROM authoritative_sessions"),
+            1
+        )
+    }
+
     func testIdenticalRemoteSourcePreservesQueuedConversationOutboxOriginAndEvents() async throws {
         let local = try StoreFixture(deviceID: "book")
         defer { local.cleanup() }

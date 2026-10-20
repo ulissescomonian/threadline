@@ -99,6 +99,7 @@ public actor ApplicationServices {
     private var syncCursor: SyncCursor
     private var runtimeIssues: [HealthIssue] = []
     private var syncInProgress = false
+    private let receivePrefetchAllowed: @Sendable () -> Bool
 
     private static let ingestionOverlap: TimeInterval = 2
     private static let syncKeyService = "com.ulisses.threadline.sync"
@@ -106,6 +107,7 @@ public actor ApplicationServices {
         subsystem: "com.ulisses.threadline",
         category: "runtime-ingestion"
     )
+    private static let syncLogger = Logger(subsystem: "com.ulisses.threadline", category: "runtime-sync")
 
     struct KeyBootstrapResolution {
         let key: Data
@@ -465,7 +467,11 @@ public actor ApplicationServices {
         transportDisplayName: String = "Synchronization",
         syncConfigurationStore: SyncConfigurationStore? = nil,
         folderAccess: ScopedFolderAccess? = nil,
-        syncCursor: SyncCursor = SyncCursor()
+        syncCursor: SyncCursor = SyncCursor(),
+        receivePrefetchAllowed: @escaping @Sendable () -> Bool = {
+            !ProcessInfo.processInfo.isLowPowerModeEnabled
+                && ProcessInfo.processInfo.thermalState.rawValue < ProcessInfo.ThermalState.serious.rawValue
+        }
     ) {
         self.store = store
         self.configuration = configuration
@@ -484,6 +490,7 @@ public actor ApplicationServices {
             reason: "Folder synchronization is not configured for this runtime."
         )
         self.syncCursor = syncCursor
+        self.receivePrefetchAllowed = receivePrefetchAllowed
     }
 
     @discardableResult
@@ -685,6 +692,11 @@ public actor ApplicationServices {
         var receivedItemCount = 0
         var receivedByteCount: Int64 = 0
         var stalledPullAttempts = 0
+        var updatedConversationIDs = Set<String>()
+        var conversationCountKnown = true
+        var supersededVersionCount = 0
+        var readingSeconds: TimeInterval = 0
+        var applyingSeconds: TimeInterval = 0
 
         // Pull first while local objects are still queued. That preserves the
         // store's ability to recognize two offline continuations and fork them
@@ -692,96 +704,152 @@ public actor ApplicationServices {
         // result is deliberately bounded, so keep advancing until the current
         // remote snapshot is drained instead of making a large first sync look
         // complete after only one page.
-        while true {
-            try Task.checkCancellation()
-            let completedBeforePull = receivedItemCount
-            let bytesBeforePull = receivedByteCount
-            let pulled = try await transport.pull(since: syncCursor) { transportProgress in
-                let totalItems = transportProgress.totalItemCount.map {
-                    completedBeforePull + $0
+        // At most one page is read ahead. Its cursor is speculative until the
+        // preceding page has committed. Structured cancellation joins the read
+        // before this sync lease can be released on failure or cancellation.
+        let receiveTransport = transport
+        let initialCursor = syncCursor
+        await onProgress(SyncProgress(
+            runID: runID, phase: .receiving, source: remoteEndpoint,
+            destination: localEndpoint, activity: "Discovering and reading remote records",
+            startedAt: startedAt
+        ))
+        try await withThrowingTaskGroup(of: TimedSyncPull.self) { group in
+            group.addTask {
+                try await Self.readSyncPage(transport: receiveTransport, cursor: initialCursor) { progress in
+                    await onProgress(SyncProgress(
+                        runID: runID, phase: .receiving, source: remoteEndpoint,
+                        destination: localEndpoint,
+                        completedItemCount: progress.completedItemCount,
+                        totalItemCount: progress.totalItemCount,
+                        completedByteCount: progress.completedByteCount,
+                        totalByteCount: progress.totalByteCount,
+                        activity: progress.activity == .enumerating ? "Discovering remote records" : "Reading encrypted remote records",
+                        startedAt: startedAt, receivedRecordCount: progress.completedItemCount
+                    ))
                 }
-                let totalBytes = transportProgress.totalByteCount.map {
-                    bytesBeforePull + $0
-                }
-                await onProgress(SyncProgress(
-                    runID: runID,
-                    phase: .receiving,
-                    source: remoteEndpoint,
-                    destination: localEndpoint,
-                    completedItemCount: completedBeforePull
-                        + transportProgress.completedItemCount,
-                    totalItemCount: totalItems,
-                    completedByteCount: bytesBeforePull
-                        + transportProgress.completedByteCount,
-                    totalByteCount: totalBytes,
-                    activity: transportProgress.activity == .enumerating
-                        ? "Discovering remote items"
-                        : "Reading encrypted remote items",
-                    startedAt: startedAt
-                ))
             }
-            let hasUnreadRemoteItems = (pulled.remainingItemCount ?? 0) > 0
-                || (pulled.remainingByteCount ?? 0) > 0
-            if pulled.envelopes.isEmpty, hasUnreadRemoteItems {
-                stalledPullAttempts += 1
-                guard stalledPullAttempts < 3 else {
-                    throw ThreadlineError.unavailable(
-                        "Remote synchronization items remain, but Threadline could not read the next item."
+            while let page = try await group.next() {
+                try Task.checkCancellation()
+                readingSeconds += page.seconds
+                let pulled = page.result
+                let hasUnreadRemoteItems = (pulled.remainingItemCount ?? 0) > 0
+                    || (pulled.remainingByteCount ?? 0) > 0
+                if pulled.envelopes.isEmpty, hasUnreadRemoteItems {
+                    stalledPullAttempts += 1
+                    guard stalledPullAttempts < 3 else {
+                        throw ThreadlineError.unavailable(
+                            "Remote synchronization items remain, but Threadline could not read the next item."
+                        )
+                    }
+                    await onProgress(SyncProgress(
+                        runID: runID,
+                        phase: .receiving,
+                        source: remoteEndpoint,
+                        destination: localEndpoint,
+                        completedItemCount: receivedItemCount,
+                        totalItemCount: pulled.remainingItemCount.map {
+                            receivedItemCount + $0
+                        },
+                        completedByteCount: receivedByteCount,
+                        totalByteCount: nil,
+                        activity: "Waiting to retry an unavailable remote item",
+                        startedAt: startedAt
+                    ))
+                    try await Task.sleep(for: .milliseconds(250 * stalledPullAttempts))
+                    let retryCursor = syncCursor
+                    group.addTask {
+                        try await Self.readSyncPage(transport: receiveTransport, cursor: retryCursor)
+                    }
+                    continue
+                }
+                stalledPullAttempts = 0
+                guard pulled.envelopes.isEmpty || pulled.cursor.token != syncCursor.token else {
+                    throw ThreadlineError.invalidPayload(
+                        "The synchronization transport returned data without advancing its cursor."
                     )
                 }
-                await onProgress(SyncProgress(
-                    runID: runID,
-                    phase: .receiving,
-                    source: remoteEndpoint,
-                    destination: localEndpoint,
-                    completedItemCount: receivedItemCount,
-                    totalItemCount: pulled.remainingItemCount.map {
-                        receivedItemCount + $0
-                    },
-                    completedByteCount: receivedByteCount,
-                    totalByteCount: nil,
-                    activity: "Waiting to retry an unavailable remote item",
-                    startedAt: startedAt
-                ))
-                try await Task.sleep(for: .milliseconds(250 * stalledPullAttempts))
-                continue
-            }
-            stalledPullAttempts = 0
-            guard pulled.envelopes.isEmpty || pulled.cursor.token != syncCursor.token else {
-                throw ThreadlineError.invalidPayload(
-                    "The synchronization transport returned data without advancing its cursor."
+                let shouldPrefetch = !pulled.envelopes.isEmpty && hasUnreadRemoteItems
+                    && receivePrefetchAllowed()
+                if shouldPrefetch {
+                    let nextCursor = pulled.cursor
+                    group.addTask {
+                        try await Self.readSyncPage(transport: receiveTransport, cursor: nextCursor)
+                    }
+                }
+                if !pulled.envelopes.isEmpty {
+                    let pulledBytes = Int64(pulled.envelopes.reduce(0) {
+                        $0 + $1.encryptedPayload.count
+                    })
+                    await onProgress(SyncProgress(
+                        runID: runID,
+                        phase: .applying,
+                        source: remoteEndpoint,
+                        destination: localEndpoint,
+                        completedItemCount: receivedItemCount,
+                        totalItemCount: receivedItemCount + pulled.envelopes.count
+                            + (pulled.remainingItemCount ?? 0),
+                        completedByteCount: receivedByteCount,
+                        // Transport progress measures encoded bytes on disk while
+                        // the store sees decrypted envelope bytes. Do not combine
+                        // those different units into a misleading percentage.
+                        totalByteCount: nil,
+                        activity: "Applying \(pulled.envelopes.count) item(s) to the local index",
+                        startedAt: startedAt,
+                        receivedRecordCount: receivedItemCount + pulled.envelopes.count,
+                        updatedConversationCount: conversationCountKnown ? updatedConversationIDs.count : nil,
+                        supersededVersionCount: supersededVersionCount,
+                        readingSeconds: readingSeconds,
+                        applyingSeconds: applyingSeconds
+                    ))
+                    let applyStart = ContinuousClock.now
+                    let recordsBeforePage = receivedItemCount
+                    let conversationsBeforePage = updatedConversationIDs
+                    let knownBeforePage = conversationCountKnown
+                    let supersededBeforePage = supersededVersionCount
+                    let readTime = readingSeconds
+                    let applyTime = applyingSeconds
+                    let applied = try await store.applyRemoteBatch(pulled.envelopes) { progress in
+                        let conversationCount = knownBeforePage
+                            ? progress.updatedConversationIDs.map { conversationsBeforePage.union($0).count }
+                            : nil
+                        await onProgress(SyncProgress(
+                            runID: runID, phase: .applying, source: remoteEndpoint,
+                            destination: localEndpoint,
+                            completedItemCount: recordsBeforePage + progress.processedEnvelopeCount,
+                            totalItemCount: recordsBeforePage + pulled.envelopes.count + (pulled.remainingItemCount ?? 0),
+                            activity: "Indexing verified conversation updates",
+                            startedAt: startedAt,
+                            receivedRecordCount: recordsBeforePage + pulled.envelopes.count,
+                            updatedConversationCount: conversationCount,
+                            supersededVersionCount: supersededBeforePage + progress.supersededVersionCount,
+                            readingSeconds: readTime,
+                            applyingSeconds: applyTime + Self.elapsedSeconds(since: applyStart)
+                        ))
+                    }
+                    applyingSeconds += Self.elapsedSeconds(since: applyStart)
+                    if let ids = applied.updatedConversationIDs {
+                        updatedConversationIDs.formUnion(ids)
+                    } else {
+                        conversationCountKnown = false
+                    }
+                    supersededVersionCount += applied.supersededVersionCount
+                    receivedItemCount += pulled.envelopes.count
+                    receivedByteCount += pulledBytes
+                }
+                try await store.saveSyncCursor(
+                    pulled.cursor,
+                    transportIdentifier: transport.identifier
                 )
+                syncCursor = pulled.cursor
+                if pulled.envelopes.isEmpty { break }
+                if !shouldPrefetch {
+                    let nextCursor = syncCursor
+                    group.addTask {
+                        try await Self.readSyncPage(transport: receiveTransport, cursor: nextCursor)
+                    }
+                }
             }
-            if !pulled.envelopes.isEmpty {
-                let pulledBytes = Int64(pulled.envelopes.reduce(0) {
-                    $0 + $1.encryptedPayload.count
-                })
-                await onProgress(SyncProgress(
-                    runID: runID,
-                    phase: .applying,
-                    source: remoteEndpoint,
-                    destination: localEndpoint,
-                    completedItemCount: receivedItemCount,
-                    totalItemCount: receivedItemCount + pulled.envelopes.count
-                        + (pulled.remainingItemCount ?? 0),
-                    completedByteCount: receivedByteCount,
-                    // Transport progress measures encoded bytes on disk while
-                    // the store sees decrypted envelope bytes. Do not combine
-                    // those different units into a misleading percentage.
-                    totalByteCount: nil,
-                    activity: "Applying \(pulled.envelopes.count) item(s) to the local index",
-                    startedAt: startedAt
-                ))
-                try await store.applyRemote(pulled.envelopes)
-                receivedItemCount += pulled.envelopes.count
-                receivedByteCount += pulledBytes
-            }
-            try await store.saveSyncCursor(
-                pulled.cursor,
-                transportIdentifier: transport.identifier
-            )
-            syncCursor = pulled.cursor
-            if pulled.envelopes.isEmpty { break }
         }
 
         // Initial libraries can contain thousands of conversations. Publish
@@ -803,7 +871,12 @@ public actor ApplicationServices {
             activity: sendingTotalItems == 0
                 ? "No local items are waiting to upload"
                 : "Preparing local items for upload",
-            startedAt: startedAt
+            startedAt: startedAt,
+            receivedRecordCount: receivedItemCount,
+            updatedConversationCount: conversationCountKnown ? updatedConversationIDs.count : nil,
+            supersededVersionCount: supersededVersionCount,
+            readingSeconds: readingSeconds,
+            applyingSeconds: applyingSeconds
         ))
         while true {
             try Task.checkCancellation()
@@ -832,7 +905,12 @@ public actor ApplicationServices {
                 completedByteCount: sentByteCount,
                 totalByteCount: sendingTotalBytes,
                 activity: "Uploaded and acknowledged \(sentItemCount) item(s)",
-                startedAt: startedAt
+                startedAt: startedAt,
+                receivedRecordCount: receivedItemCount,
+                updatedConversationCount: conversationCountKnown ? updatedConversationIDs.count : nil,
+                supersededVersionCount: supersededVersionCount,
+                readingSeconds: readingSeconds,
+                applyingSeconds: applyingSeconds
             ))
         }
         await onProgress(SyncProgress(
@@ -845,22 +923,55 @@ public actor ApplicationServices {
             completedByteCount: sentByteCount,
             totalByteCount: sentByteCount,
             activity: "Saving the completed synchronization state",
-            startedAt: startedAt
+            startedAt: startedAt,
+            receivedRecordCount: receivedItemCount,
+            updatedConversationCount: conversationCountKnown ? updatedConversationIDs.count : nil,
+            supersededVersionCount: supersededVersionCount,
+            readingSeconds: readingSeconds,
+            applyingSeconds: applyingSeconds
         ))
         runtimeIssues.removeAll { $0.id == "sync-unavailable" }
         try await syncConfigurationStore.markSyncSuccessful()
         await onProgress(SyncProgress(
             runID: runID,
             phase: .completed,
-            source: localEndpoint,
-            destination: remoteEndpoint,
-            completedItemCount: sentItemCount,
-            totalItemCount: sentItemCount,
-            completedByteCount: sentByteCount,
-            totalByteCount: sentByteCount,
+            source: sentItemCount == 0 && receivedItemCount > 0 ? remoteEndpoint : localEndpoint,
+            destination: sentItemCount == 0 && receivedItemCount > 0 ? localEndpoint : remoteEndpoint,
+            completedItemCount: sentItemCount == 0 ? receivedItemCount : sentItemCount,
+            totalItemCount: sentItemCount == 0 ? receivedItemCount : sentItemCount,
+            completedByteCount: sentItemCount == 0 ? receivedByteCount : sentByteCount,
+            totalByteCount: sentItemCount == 0 ? receivedByteCount : sentByteCount,
             activity: "Synchronization completed",
-            startedAt: startedAt
+            startedAt: startedAt,
+            receivedRecordCount: receivedItemCount,
+            updatedConversationCount: conversationCountKnown ? updatedConversationIDs.count : nil,
+            supersededVersionCount: supersededVersionCount,
+            readingSeconds: readingSeconds,
+            applyingSeconds: applyingSeconds
         ))
+        Self.syncLogger.debug(
+            "Sync completed: received=\(receivedItemCount, privacy: .public), conversations=\(updatedConversationIDs.count, privacy: .public), superseded=\(supersededVersionCount, privacy: .public), read_ms=\(Int(readingSeconds * 1_000), privacy: .public), apply_ms=\(Int(applyingSeconds * 1_000), privacy: .public)"
+        )
+    }
+
+    private struct TimedSyncPull: Sendable {
+        let result: SyncPullResult
+        let seconds: TimeInterval
+    }
+
+    private nonisolated static func readSyncPage(
+        transport: any SyncTransport,
+        cursor: SyncCursor,
+        onProgress: @escaping @Sendable (SyncTransportProgress) async -> Void = { _ in }
+    ) async throws -> TimedSyncPull {
+        let start = ContinuousClock.now
+        let result = try await transport.pull(since: cursor, onProgress: onProgress)
+        return TimedSyncPull(result: result, seconds: elapsedSeconds(since: start))
+    }
+
+    private nonisolated static func elapsedSeconds(since start: ContinuousClock.Instant) -> TimeInterval {
+        let duration = start.duration(to: .now).components
+        return Double(duration.seconds) + Double(duration.attoseconds) / 1e18
     }
 
     public func devicesSnapshot(refreshRemote: Bool = false) async -> DeviceRegistrySnapshot {

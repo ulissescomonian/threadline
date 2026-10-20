@@ -53,6 +53,24 @@ extension SyncProgress {
         "\(threadlineDirection) • \(threadlineCompactProgress)"
     }
 
+    var threadlineReceiveSummary: String? {
+        guard receivedRecordCount > 0 else { return nil }
+        var summary = "\(receivedRecordCount.formatted()) records read"
+        if let updatedConversationCount {
+            summary += " • \(updatedConversationCount.formatted()) conversations updated"
+        }
+        if supersededVersionCount > 0 {
+            summary += " • \(supersededVersionCount.formatted()) earlier versions consolidated"
+        }
+        return summary
+    }
+
+    var threadlineReceiveTiming: String? {
+        guard readingSeconds > 0 || applyingSeconds > 0 else { return nil }
+        return "Reading: \(readingSeconds.formatted(.number.precision(.fractionLength(1)))) s"
+            + " • Indexing: \(applyingSeconds.formatted(.number.precision(.fractionLength(1)))) s"
+    }
+
     func threadlineTimeSinceAdvance(at date: Date) -> String {
         let interval = max(0, date.timeIntervalSince(lastAdvancedAt))
         if interval < 1 { return "just now" }
@@ -76,6 +94,8 @@ extension SyncProgress {
         ]
         if let byteProgress = threadlineByteProgress { components.append(byteProgress) }
         if let percentage = threadlinePercentage { components.append(percentage) }
+        if let summary = threadlineReceiveSummary { components.append(summary) }
+        if let timing = threadlineReceiveTiming { components.append(timing) }
         components.append(activity)
         components.append("Last advanced \(threadlineTimeSinceAdvance(at: date))")
         return components.joined(separator: ", ")

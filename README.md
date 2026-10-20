@@ -13,23 +13,23 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ulissescomonian/threadline/releases/tag/v1.0.0"><img src="https://img.shields.io/badge/version-1.0.0-blue?style=flat-square" alt="Version 1.0.0"></a>
+  <a href="https://github.com/ulissescomonian/threadline/releases/tag/v1.0.1"><img src="https://img.shields.io/badge/version-1.0.1-blue?style=flat-square" alt="Version 1.0.1"></a>
   <img src="https://img.shields.io/badge/macOS-14.0%2B-black?style=flat-square&amp;logo=apple" alt="macOS 14.0 or later">
   <img src="https://img.shields.io/badge/Apple%20Silicon-arm64-555555?style=flat-square&amp;logo=apple" alt="Apple Silicon arm64">
   <img src="https://img.shields.io/badge/Swift-6.1-orange?style=flat-square&amp;logo=swift" alt="Swift 6.1">
-  <a href="https://github.com/ulissescomonian/threadline/releases/tag/v1.0.0"><img src="https://img.shields.io/badge/status-Release-2ea44f?style=flat-square" alt="Release status"></a>
+  <a href="https://github.com/ulissescomonian/threadline/releases/tag/v1.0.1"><img src="https://img.shields.io/badge/status-Release-2ea44f?style=flat-square" alt="Release status"></a>
   <a href="https://github.com/ulissescomonian/threadline/actions/workflows/ci.yml"><img src="https://github.com/ulissescomonian/threadline/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/ulissescomonian/threadline?style=flat-square" alt="MIT License"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/ulissescomonian/threadline/releases/download/v1.0.0/Threadline-1.0.0-arm64.dmg"><strong>Download Threadline 1.0.0 for Apple Silicon (.dmg)</strong></a>
+  <a href="https://github.com/ulissescomonian/threadline/releases/download/v1.0.1/Threadline-1.0.1-arm64.dmg"><strong>Download Threadline 1.0.1 for Apple Silicon (.dmg)</strong></a>
   <br>
-  <a href="https://github.com/ulissescomonian/threadline/releases/tag/v1.0.0">Release notes and SHA-256 checksum</a>
+  <a href="https://github.com/ulissescomonian/threadline/releases/tag/v1.0.1">Release notes and SHA-256 checksum</a>
 </p>
 
 > [!IMPORTANT]
-> Threadline 1.0.0 (build 13) is the first release. Keep the original Codex and Claude
+> Threadline 1.0.1 (build 15) is the current release. Keep the original Codex and Claude
 > Code histories. The Apple Silicon DMG is not signed. It contains an app with
 > a local code signature, not an Apple Developer ID signature; neither the app
 > nor the DMG is notarized by Apple. Install it only from a source you trust,
@@ -66,6 +66,8 @@ folders or places its live SQLite database in cloud storage.
 - signed sync-space manifest and encrypted device profiles
 - immutable, idempotent per-device segments and contiguous receive cursors
 - bounded batches, partial-file protection, quarantine, and safe retry
+- faster catch-up with reusable folder inventories, bounded read-ahead, and
+  batched local indexing of verified conversation updates
 - coordinated migration between storage providers
 - any practical number of participating Macs; the design is not pair-specific
 
@@ -116,6 +118,10 @@ Threadline separates connection health from queue state:
   the safe local queue and retries automatically; **Sync Now** can request the
   next attempt sooner.
 
+During manual synchronization, **Health Center** distinguishes records read
+from unique conversations updated and reports reading and indexing times.
+Several records may be historical versions of the same conversation.
+
 ## Architecture
 
 ```mermaid
@@ -159,12 +165,12 @@ The release DMG is not universal and does not run natively on Intel Macs.
 
 ## Install the release DMG
 
-1. Download `Threadline-1.0.0-arm64.dmg` and
-   `Threadline-1.0.0-arm64.dmg.sha256` from the same trusted GitHub Release.
+1. Download `Threadline-1.0.1-arm64.dmg` and
+   `Threadline-1.0.1-arm64.dmg.sha256` from the same trusted GitHub Release.
 2. Verify the download from its directory:
 
    ```bash
-   shasum -a 256 -c Threadline-1.0.0-arm64.dmg.sha256
+   shasum -a 256 -c Threadline-1.0.1-arm64.dmg.sha256
    ```
 
 3. Open the DMG and drag **Threadline.app** to **Applications**.
@@ -268,15 +274,15 @@ Package the already built, locally signed app inside the unsigned release DMG:
 ```bash
 CODESIGN_IDENTITY="Your Local Signing Identity" make app
 Scripts/package_dmg.sh
-shasum -a 256 -c dist/Threadline-1.0.0-arm64.dmg.sha256
+(cd dist && shasum -a 256 -c Threadline-1.0.1-arm64.dmg.sha256)
 ```
 
 `Scripts/package_dmg.sh` verifies the app signature and executable architecture,
 creates a compressed DMG with an Applications shortcut, verifies the image, and
 writes:
 
-- `dist/Threadline-1.0.0-arm64.dmg`
-- `dist/Threadline-1.0.0-arm64.dmg.sha256`
+- `dist/Threadline-1.0.1-arm64.dmg`
+- `dist/Threadline-1.0.1-arm64.dmg.sha256`
 
 The version and architecture come from the packaged app. `APP_PATH` and
 `OUTPUT_DIR` can override the default `.build/Threadline.app` and `dist/`

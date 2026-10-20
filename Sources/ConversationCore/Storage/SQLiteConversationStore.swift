@@ -10,6 +10,8 @@ public actor SQLiteConversationStore: ConversationStore {
     private let queuesForSync: Bool
     private var cachedIntegrityCheck: (result: String, checkedAtUptime: TimeInterval)?
     internal private(set) var integrityCheckExecutionCount = 0
+    internal private(set) var remoteBatchCommitCount = 0
+    internal private(set) var remoteConversationWriteCount = 0
 
     public init(
         databaseURL: URL,
@@ -298,6 +300,25 @@ public actor SQLiteConversationStore: ConversationStore {
                 )
                 appliedSchemaTransformation = true
             }
+            let hasAuthoritativeSessionMigration = try database.scalarInt(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 8"
+            ) > 0
+            if !hasAuthoritativeSessionMigration {
+                try database.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS authoritative_sessions (
+                        provider TEXT NOT NULL,
+                        provider_session_id TEXT NOT NULL,
+                        accepted_envelope_at REAL NOT NULL DEFAULT 0,
+                        PRIMARY KEY(provider, provider_session_id)
+                    )
+                    """
+                )
+                try database.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(8, ?)",
+                    bindings: [.real(Date().timeIntervalSince1970)]
+                )
+            }
             try database.execute(
                 """
                 UPDATE conversations
@@ -398,6 +419,12 @@ public actor SQLiteConversationStore: ConversationStore {
     }
 
     public func upsertIfChanged(_ conversation: ProviderConversation) async throws -> Bool {
+        if let authoritativeDeviceID = try metadataText(key: Self.authoritativeDeviceMetadataKey),
+           authoritativeDeviceID != deviceID,
+           try isAuthoritativeSession(conversation) {
+            return false
+        }
+
         let existingSource = try database.rows(
             "SELECT source_fingerprint, source_schema_version FROM conversations WHERE id = ?",
             bindings: [.text(conversation.summary.id)]
@@ -612,33 +639,156 @@ public actor SQLiteConversationStore: ConversationStore {
     }
 
     public func applyRemote(_ envelopes: [SyncEnvelope]) async throws {
-        guard !envelopes.isEmpty else { return }
-        for envelope in envelopes {
-            let incoming: ProviderConversation
-            do {
-                try SyncEnvelopeLimits.validate(envelope)
-                incoming = try envelopeCodec.open(envelope)
-            } catch {
-                try database.transaction {
-                    try quarantine(envelope, error: error)
-                }
-                continue
-            }
+        _ = try await applyRemoteBatch(envelopes)
+    }
 
-            try database.transaction {
-                if envelope.originDeviceID != deviceID,
-                   let resolved = try resolveRemoteConflict(incoming, envelope: envelope) {
-                    try write(resolved, syncAvailability: .availableOffline)
-                }
-                try database.execute(
-                    "DELETE FROM sync_quarantine WHERE envelope_id = ?",
-                    bindings: [.text(envelope.id)]
-                )
+    public func applyRemoteBatch(
+        _ envelopes: [SyncEnvelope],
+        onProgress: @escaping @Sendable (RemoteApplyResult) async -> Void = { _ in }
+    ) async throws -> RemoteApplyResult {
+        var processed = 0
+        var updatedIDs = Set<String>()
+        var superseded = 0
+        var quarantined = 0
+        while processed < envelopes.count {
+            try Task.checkCancellation()
+            let start = processed
+            var end = start
+            var payloadBytes = 0
+            while end < envelopes.count, end - start < 32 {
+                let bytes = envelopes[end].encryptedPayload.count
+                if end > start, bytes > 16 * 1_024 * 1_024 - payloadBytes { break }
+                payloadBytes += bytes
+                end += 1
             }
+            // Authenticate every version before considering coalescing. An
+            // invalid payload still enters quarantine and never selects a winner.
+            var decoded: [DecodedRemoteConversation] = []
+            var decodedIndices: [Int: Int] = [:]
+            var invalid: [Int: any Error] = [:]
+            for position in start..<end {
+                let envelope = envelopes[position]
+                try Task.checkCancellation()
+                do {
+                    try SyncEnvelopeLimits.validate(envelope)
+                    let incoming = try envelopeCodec.open(envelope)
+                    decodedIndices[position] = decoded.count
+                    decoded.append(DecodedRemoteConversation(
+                        envelope: envelope,
+                        conversation: incoming
+                    ))
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    invalid[position] = error
+                }
+            }
+            var committedIDs = Set<String>()
+            var committedWrites = 0
+            var committedSuperseded = 0
+            try database.transaction {
+                let supersededIndices = try supersededRemoteVersions(in: decoded)
+                for position in start..<end {
+                    try Task.checkCancellation()
+                    guard let index = decodedIndices[position] else {
+                        if let error = invalid[position] {
+                            try quarantine(envelopes[position], error: error)
+                        }
+                        continue
+                    }
+                    let record = decoded[index]
+                    if supersededIndices.contains(index) {
+                        committedSuperseded += 1
+                    } else if record.envelope.originDeviceID != deviceID,
+                              let resolved = try resolveRemoteConflict(
+                                record.conversation, envelope: record.envelope
+                              ) {
+                        try write(resolved, syncAvailability: .availableOffline)
+                        committedIDs.insert(resolved.summary.id)
+                        committedWrites += 1
+                    }
+                    try database.execute(
+                        "DELETE FROM sync_quarantine WHERE envelope_id = ?",
+                        bindings: [.text(record.envelope.id)]
+                    )
+                }
+                try setMetadataDate(Date(), key: "last_sync_at")
+            }
+            remoteBatchCommitCount += 1
+            remoteConversationWriteCount += committedWrites
+            processed = end
+            updatedIDs.formUnion(committedIDs)
+            superseded += committedSuperseded
+            quarantined += invalid.count
+            await onProgress(RemoteApplyResult(
+                processedEnvelopeCount: processed,
+                updatedConversationIDs: updatedIDs,
+                supersededVersionCount: superseded,
+                quarantinedEnvelopeCount: quarantined
+            ))
+            await Task.yield()
         }
-        try database.transaction {
-            try setMetadataDate(Date(), key: "last_sync_at")
+        return RemoteApplyResult(
+            processedEnvelopeCount: processed,
+            updatedConversationIDs: updatedIDs,
+            supersededVersionCount: superseded,
+            quarantinedEnvelopeCount: quarantined
+        )
+    }
+
+    private struct DecodedRemoteConversation {
+        let envelope: SyncEnvelope
+        let conversation: ProviderConversation
+    }
+
+    private struct RemoteSessionKey: Hashable {
+        let provider: ProviderKind
+        let sessionID: String
+    }
+
+    private func supersededRemoteVersions(in records: [DecodedRemoteConversation]) throws -> Set<Int> {
+        // A locally designated source has special first-arrival semantics.
+        // Keep that path and cross-device conflicts exactly as before.
+        guard try metadataText(key: Self.authoritativeDeviceMetadataKey) != deviceID else { return [] }
+        let groups = Dictionary(grouping: records.indices) { records[$0].conversation.summary.id }
+        let sessionGroups = Dictionary(grouping: records) {
+            RemoteSessionKey(provider: $0.conversation.summary.provider, sessionID: $0.conversation.summary.providerSessionID)
         }
+        var skipped = Set<Int>()
+        for (id, indices) in groups where indices.count > 1 {
+            let first = records[indices[0]].conversation
+            let session = RemoteSessionKey(provider: first.summary.provider, sessionID: first.summary.providerSessionID)
+            guard sessionGroups[session]?.allSatisfy({ $0.conversation.summary.id == id }) == true else { continue }
+            let existing = try database.rows(
+                "SELECT origin_device_id, source_fingerprint, source_schema_version, updated_at FROM conversations WHERE id = ?",
+                bindings: [.text(id)]
+            ).first
+            if let existing {
+                guard existing[safe: 0]?.string == first.summary.originDeviceID,
+                      let date = existing[safe: 3]?.double,
+                      first.summary.updatedAt.timeIntervalSince1970 >= date,
+                      !indices.contains(where: {
+                          records[$0].conversation.sourceFingerprint == existing[safe: 1]?.string
+                              && records[$0].conversation.sourceSchemaVersion == existing[safe: 2]?.string
+                      }) else { continue }
+            }
+            let canCoalesce = zip(indices, indices.dropFirst()).allSatisfy { left, right in
+                let older = records[left]
+                let newer = records[right]
+                return older.envelope.originDeviceID == newer.envelope.originDeviceID
+                    && older.conversation.summary.provider == newer.conversation.summary.provider
+                    && older.conversation.summary.providerSessionID == newer.conversation.summary.providerSessionID
+                    && older.conversation.summary.isFavorite == newer.conversation.summary.isFavorite
+                    && older.conversation.sourceSchemaVersion == newer.conversation.sourceSchemaVersion
+                    && newer.envelope.createdAt >= older.envelope.createdAt
+                    && newer.conversation.summary.updatedAt >= older.conversation.summary.updatedAt
+                    && (older.conversation.sourceFingerprint != newer.conversation.sourceFingerprint
+                        || older.conversation == newer.conversation)
+                    && newer.conversation.events.starts(with: older.conversation.events)
+            }
+            if canCoalesce { skipped.formUnion(indices.dropLast()) }
+        }
+        return skipped
     }
 
     public func healthSnapshot() async throws -> HealthSnapshot {
@@ -773,11 +923,7 @@ public actor SQLiteConversationStore: ConversationStore {
         let start = isAppendOnly ? existingEventIDs.count : 0
         for position in start..<conversation.events.count {
             let event = conversation.events[position]
-            let persistedID = try Self.persistedEventID(
-                conversationID: summary.id,
-                position: position,
-                event: event
-            )
+            let persistedID = incomingEventIDs[position]
             var metadata = event.metadata
             metadata[Self.sourceEventIDMetadataKey] = event.id
             try database.execute(
@@ -1041,9 +1187,7 @@ public actor SQLiteConversationStore: ConversationStore {
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        let digest = SHA256.hash(data: try encoder.encode(identity))
-            .map { String(format: "%02x", $0) }
-            .joined()
+        let digest = HexEncoding.lowercaseString(SHA256.hash(data: try encoder.encode(identity)))
         return "event:\(digest)"
     }
 
@@ -1109,6 +1253,67 @@ public actor SQLiteConversationStore: ConversationStore {
         _ incoming: ProviderConversation,
         envelope: SyncEnvelope
     ) throws -> ProviderConversation? {
+        let authoritativeDeviceID = try metadataText(key: Self.authoritativeDeviceMetadataKey)
+        if authoritativeDeviceID == deviceID {
+            let existingSessionCount = try database.scalarInt(
+                "SELECT COUNT(*) FROM conversations WHERE provider = ? AND provider_session_id = ?",
+                bindings: [
+                    .text(incoming.summary.provider.rawValue),
+                    .text(incoming.summary.providerSessionID),
+                ]
+            )
+            if existingSessionCount > 0 { return nil }
+        } else if authoritativeDeviceID == envelope.originDeviceID {
+            let acceptedAt = try database.rows(
+                "SELECT accepted_envelope_at FROM authoritative_sessions WHERE provider = ? AND provider_session_id = ?",
+                bindings: [
+                    .text(incoming.summary.provider.rawValue),
+                    .text(incoming.summary.providerSessionID),
+                ]
+            ).first?.first?.double
+            if let acceptedAt,
+               envelope.createdAt.timeIntervalSince1970 <= acceptedAt {
+                return nil
+            }
+        } else if authoritativeDeviceID != nil,
+                  try isAuthoritativeSession(incoming) {
+            return nil
+        }
+
+        let resolved = try resolveOrdinaryRemoteConflict(incoming, envelope: envelope)
+        if authoritativeDeviceID == envelope.originDeviceID {
+            try database.execute(
+                """
+                INSERT INTO authoritative_sessions(provider, provider_session_id, accepted_envelope_at)
+                VALUES(?, ?, ?)
+                ON CONFLICT(provider, provider_session_id) DO UPDATE
+                SET accepted_envelope_at = excluded.accepted_envelope_at
+                """,
+                bindings: [
+                    .text(incoming.summary.provider.rawValue),
+                    .text(incoming.summary.providerSessionID),
+                    .real(envelope.createdAt.timeIntervalSince1970),
+                ]
+            )
+            try database.execute(
+                """
+                DELETE FROM sync_outbox WHERE object_id IN (
+                    SELECT id FROM conversations WHERE provider = ? AND provider_session_id = ?
+                ) AND acknowledged_at IS NULL
+                """,
+                bindings: [
+                    .text(incoming.summary.provider.rawValue),
+                    .text(incoming.summary.providerSessionID),
+                ]
+            )
+        }
+        return resolved
+    }
+
+    private func resolveOrdinaryRemoteConflict(
+        _ incoming: ProviderConversation,
+        envelope: SyncEnvelope
+    ) throws -> ProviderConversation? {
         let existing = try database.rows(
             "SELECT source_fingerprint, source_schema_version, updated_at, origin_device_id FROM conversations WHERE id = ?",
             bindings: [.text(incoming.summary.id)]
@@ -1170,6 +1375,16 @@ public actor SQLiteConversationStore: ConversationStore {
             sourceFingerprint: incoming.sourceFingerprint,
             sourceSchemaVersion: incoming.sourceSchemaVersion
         )
+    }
+
+    private func isAuthoritativeSession(_ conversation: ProviderConversation) throws -> Bool {
+        try database.scalarInt(
+            "SELECT COUNT(*) FROM authoritative_sessions WHERE provider = ? AND provider_session_id = ?",
+            bindings: [
+                .text(conversation.summary.provider.rawValue),
+                .text(conversation.summary.providerSessionID),
+            ]
+        ) > 0
     }
 
     private func quarantine(_ envelope: SyncEnvelope, error: Error) throws {
@@ -1307,6 +1522,7 @@ public actor SQLiteConversationStore: ConversationStore {
     """
 
     internal static let preVersion5BackupSuffix = ".pre-v5.backup"
+    private static let authoritativeDeviceMetadataKey = "threadline.authoritative-device.v1"
 
     private static func decodeSummary(_ row: [SQLiteValue]) throws -> ConversationSummary {
         guard row.count >= 18,

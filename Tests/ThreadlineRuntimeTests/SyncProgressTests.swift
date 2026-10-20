@@ -121,6 +121,169 @@ final class SyncProgressTests: XCTestCase {
         let cursor = try await store.loadSyncCursor(transportIdentifier: transport.identifier)
         XCTAssertEqual(cursor, SyncCursor())
     }
+
+    func testReadAheadOverlapsApplicationAndProgressCountsConversationsSeparately() async throws {
+        let fixture = try makePipelineFixture(failApplication: false)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let recorder = ProgressRecorder()
+        try await fixture.services.syncNow { await recorder.append($0) }
+        let overlapped = await fixture.probe.overlapped
+        let values = await recorder.snapshots()
+        XCTAssertTrue(overlapped)
+        XCTAssertEqual(values.last?.receivedRecordCount, 3)
+        XCTAssertEqual(values.last?.updatedConversationCount, 1)
+        XCTAssertEqual(values.last?.supersededVersionCount, 1)
+        XCTAssertGreaterThan(values.last?.readingSeconds ?? 0, 0)
+        XCTAssertGreaterThan(values.last?.applyingSeconds ?? 0, 0)
+        let applied = await fixture.store.appliedIDs()
+        XCTAssertEqual(applied, ["first-a", "first-b", "second-c"])
+    }
+
+    func testFailedApplicationCancelsReadAheadWithoutSavingSpeculativeCursor() async throws {
+        let fixture = try makePipelineFixture(failApplication: true)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            try await fixture.services.syncNow()
+            XCTFail("Expected synthetic application failure")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("synthetic apply failure"))
+        }
+        let cursor = try await fixture.store.loadSyncCursor(transportIdentifier: fixture.transport.identifier)
+        let cancelled = await fixture.probe.cancelled
+        let pushes = await fixture.transport.pushes
+        XCTAssertEqual(cursor, SyncCursor())
+        XCTAssertTrue(cancelled)
+        XCTAssertEqual(pushes, 0)
+    }
+
+    private func makePipelineFixture(failApplication: Bool) throws -> (
+        root: URL, services: ApplicationServices, store: PipelineStore,
+        transport: PipelineTransport, probe: PipelineReadProbe
+    ) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("ThreadlinePipelineTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let probe = PipelineReadProbe()
+        let store = PipelineStore(probe: probe, failApplication: failApplication)
+        let transport = PipelineTransport(probe: probe, blockPrefetch: failApplication)
+        let registry = ProgressReadyRegistry()
+        let services = ApplicationServices(
+            store: store,
+            configuration: RuntimeConfiguration(
+                applicationSupportURL: root,
+                codexHomeURL: root.appendingPathComponent("codex"),
+                claudeHomeURL: root.appendingPathComponent("claude")
+            ),
+            deviceID: registry.currentDeviceID, providers: ProviderRegistry(adapters: [:]),
+            transport: transport, deviceRegistry: registry, remoteSyncConfigured: true,
+            receivePrefetchAllowed: { true }
+        )
+        return (root, services, store, transport, probe)
+    }
+}
+
+private actor PipelineReadProbe {
+    private var started = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    private(set) var overlapped = false
+    private(set) var cancelled = false
+
+    func didStartPrefetch() {
+        started = true
+        continuation?.resume()
+        continuation = nil
+    }
+
+    func awaitPrefetch() async {
+        let timeout = Task {
+            do { try await Task.sleep(for: .seconds(2)) } catch { return }
+            self.releaseWaiter()
+        }
+        defer { timeout.cancel() }
+        if !started {
+            await withCheckedContinuation { continuation = $0 }
+        }
+        overlapped = started
+    }
+
+    private func releaseWaiter() {
+        continuation?.resume()
+        continuation = nil
+    }
+    func didCancel() { cancelled = true }
+}
+
+private actor PipelineTransport: SyncTransport {
+    nonisolated let identifier = "pipeline-transport"
+    let probe: PipelineReadProbe
+    let blockPrefetch: Bool
+    private(set) var pushes = 0
+
+    init(probe: PipelineReadProbe, blockPrefetch: Bool) {
+        self.probe = probe
+        self.blockPrefetch = blockPrefetch
+    }
+    func healthCheck() async -> Bool { true }
+    func push(_ envelopes: [SyncEnvelope]) async throws { pushes += 1 }
+    func pull(since cursor: SyncCursor) async throws -> SyncPullResult {
+        switch cursor.token {
+        case nil:
+            return SyncPullResult(
+                envelopes: [progressEnvelope(id: "first-a"), progressEnvelope(id: "first-b")],
+                cursor: SyncCursor(token: Data([1])), remainingItemCount: 1, remainingByteCount: 32
+            )
+        case Data([1]):
+            await probe.didStartPrefetch()
+            if blockPrefetch {
+                do { try await Task.sleep(for: .seconds(30)) }
+                catch { await probe.didCancel(); throw error }
+            }
+            return SyncPullResult(
+                envelopes: [progressEnvelope(id: "second-c")],
+                cursor: SyncCursor(token: Data([2])), remainingItemCount: 0, remainingByteCount: 0
+            )
+        default:
+            return SyncPullResult(envelopes: [], cursor: cursor)
+        }
+    }
+}
+
+private actor PipelineStore: ConversationStore {
+    let probe: PipelineReadProbe
+    let failApplication: Bool
+    private var applied: [String] = []
+    private var cursor = SyncCursor()
+
+    init(probe: PipelineReadProbe, failApplication: Bool) {
+        self.probe = probe
+        self.failApplication = failApplication
+    }
+    func migrate() async throws {}
+    func upsert(_ conversation: ProviderConversation) async throws {}
+    func listConversations(query: String?, provider: ProviderKind?, favoritesOnly: Bool) async throws -> [ConversationSummary] { [] }
+    func conversation(id: String) async throws -> ConversationDetail? { nil }
+    func setFavorite(_ favorite: Bool, conversationID: String) async throws {}
+    func setNotes(_ notes: String, conversationID: String) async throws {}
+    func pendingEnvelopes(limit: Int) async throws -> [SyncEnvelope] { [] }
+    func markEnvelopesAcknowledged(ids: [String]) async throws {}
+    func applyRemote(_ envelopes: [SyncEnvelope]) async throws { applied += envelopes.map(\.id) }
+    func applyRemoteBatch(
+        _ envelopes: [SyncEnvelope],
+        onProgress: @escaping @Sendable (RemoteApplyResult) async -> Void
+    ) async throws -> RemoteApplyResult {
+        if applied.isEmpty { await probe.awaitPrefetch() }
+        if failApplication { throw ThreadlineError.database("synthetic apply failure") }
+        applied += envelopes.map(\.id)
+        let result = RemoteApplyResult(
+            processedEnvelopeCount: envelopes.count, updatedConversationIDs: ["one-conversation"],
+            supersededVersionCount: max(0, envelopes.count - 1)
+        )
+        await onProgress(result)
+        return result
+    }
+    func healthSnapshot() async throws -> HealthSnapshot { HealthSnapshot() }
+    func loadSyncCursor(transportIdentifier: String) async throws -> SyncCursor { cursor }
+    func saveSyncCursor(_ cursor: SyncCursor, transportIdentifier: String) async throws { self.cursor = cursor }
+    func appliedIDs() -> [String] { applied }
 }
 
 private actor ProgressRecorder {

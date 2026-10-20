@@ -12,6 +12,12 @@ enum SQLiteValue {
 final class SQLiteConnection {
     private var handle: OpaquePointer?
     private let path: String
+    private var statements: [String: OpaquePointer] = [:]
+    private var statementOrder: [String] = []
+    internal private(set) var preparedStatementCount = 0
+    internal private(set) var committedTransactionCount = 0
+    internal var cachedStatementCount: Int { statements.count }
+    private static let maximumCachedStatements = 128
 
     init(path: String) throws {
         self.path = path
@@ -37,12 +43,13 @@ final class SQLiteConnection {
     }
 
     deinit {
+        for statement in statements.values { sqlite3_finalize(statement) }
         if let handle { sqlite3_close(handle) }
     }
 
     func execute(_ sql: String, bindings: [SQLiteValue] = []) throws {
         let statement = try prepare(sql)
-        defer { sqlite3_finalize(statement) }
+        defer { recycle(statement, for: sql) }
         try bind(bindings, to: statement)
         let result = sqlite3_step(statement)
         guard result == SQLITE_DONE || result == SQLITE_ROW else {
@@ -52,7 +59,7 @@ final class SQLiteConnection {
 
     func rows(_ sql: String, bindings: [SQLiteValue] = []) throws -> [[SQLiteValue]] {
         let statement = try prepare(sql)
-        defer { sqlite3_finalize(statement) }
+        defer { recycle(statement, for: sql) }
         try bind(bindings, to: statement)
 
         var output: [[SQLiteValue]] = []
@@ -78,6 +85,7 @@ final class SQLiteConnection {
         do {
             let value = try body()
             try execute("COMMIT")
+            committedTransactionCount += 1
             try enforceSecurePermissions()
             return value
         } catch {
@@ -228,12 +236,37 @@ final class SQLiteConnection {
 
     private func prepare(_ sql: String) throws -> OpaquePointer {
         guard let handle else { throw ThreadlineError.database("The database is closed") }
+        if let statement = statements.removeValue(forKey: sql) {
+            statementOrder.removeAll { $0 == sql }
+            return statement
+        }
         var statement: OpaquePointer?
         let result = sqlite3_prepare_v2(handle, sql, -1, &statement, nil)
         guard result == SQLITE_OK, let statement else {
             throw databaseError(prefix: "Could not prepare SQLite statement")
         }
+        preparedStatementCount += 1
         return statement
+    }
+
+    private func recycle(_ statement: OpaquePointer, for sql: String) {
+        // Clear bindings even after errors, so no transcript or previous
+        // parameter survives in an idle cached statement. sqlite3_prepare_v2
+        // automatically recompiles cached statements after schema changes.
+        sqlite3_reset(statement)
+        sqlite3_clear_bindings(statement)
+        if statements.count >= Self.maximumCachedStatements,
+           let oldest = statementOrder.first {
+            statementOrder.removeFirst()
+            if let evicted = statements.removeValue(forKey: oldest) {
+                sqlite3_finalize(evicted)
+            }
+        }
+        if let previous = statements.updateValue(statement, forKey: sql) {
+            sqlite3_finalize(previous)
+            statementOrder.removeAll { $0 == sql }
+        }
+        statementOrder.append(sql)
     }
 
     private func bind(_ values: [SQLiteValue], to statement: OpaquePointer) throws {

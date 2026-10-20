@@ -337,6 +337,26 @@ public struct SyncPullResult: Sendable {
     }
 }
 
+public struct RemoteApplyResult: Sendable {
+    public let processedEnvelopeCount: Int
+    /// Nil when a store cannot report verified conversation identities.
+    public let updatedConversationIDs: Set<String>?
+    public let supersededVersionCount: Int
+    public let quarantinedEnvelopeCount: Int
+
+    public init(
+        processedEnvelopeCount: Int,
+        updatedConversationIDs: Set<String>? = nil,
+        supersededVersionCount: Int = 0,
+        quarantinedEnvelopeCount: Int = 0
+    ) {
+        self.processedEnvelopeCount = processedEnvelopeCount
+        self.updatedConversationIDs = updatedConversationIDs
+        self.supersededVersionCount = supersededVersionCount
+        self.quarantinedEnvelopeCount = quarantinedEnvelopeCount
+    }
+}
+
 public struct HealthIssue: Codable, Sendable, Hashable, Identifiable {
     public enum Severity: String, Codable, Sendable { case info, warning, error }
 
